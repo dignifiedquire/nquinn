@@ -1,6 +1,7 @@
 use std::{any::Any, str, sync::Arc};
 
 use aes::cipher::{BlockEncrypt, KeyInit};
+use aes_gcm::{AeadInPlace, NewAead};
 use bytes::BytesMut;
 use snow::resolvers::CryptoResolver;
 
@@ -207,7 +208,7 @@ impl crypto::Session for NquicSession {
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
-        todo!()
+        is_valid_retry(orig_dst_cid, header, payload)
     }
 
     fn export_keying_material(
@@ -220,19 +221,34 @@ impl crypto::Session for NquicSession {
     }
 }
 
-const RETRY_INTEGRITY_KEY_DRAFT: [u8; 16] = [
-    0xcc, 0xce, 0x18, 0x7e, 0xd0, 0x9a, 0x09, 0xd0, 0x57, 0x28, 0x15, 0x5a, 0x6c, 0xb9, 0x6b, 0xe1,
-];
-const RETRY_INTEGRITY_NONCE_DRAFT: [u8; 12] = [
-    0xe5, 0x49, 0x30, 0xf9, 0x7f, 0x21, 0x36, 0xf0, 0x53, 0x0a, 0x8c, 0x1c,
-];
-
 const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
     0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 ];
 const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
+
+fn is_valid_retry(orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
+    let tag_start = match payload.len().checked_sub(16) {
+        Some(x) => x,
+        None => return false,
+    };
+
+    let mut pseudo_packet =
+        Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
+    pseudo_packet.push(orig_dst_cid.len() as u8);
+    pseudo_packet.extend_from_slice(orig_dst_cid);
+    pseudo_packet.extend_from_slice(header);
+    let tag_start = tag_start + pseudo_packet.len();
+    pseudo_packet.extend_from_slice(payload);
+
+    let (nonce, key) = (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1);
+
+    let key = aes_gcm::Aes128Gcm::new_from_slice(&key[..]).unwrap();
+    let mut tag = pseudo_packet.split_off(tag_start);
+    let aad = pseudo_packet;
+    key.decrypt_in_place(&nonce.into(), &aad, &mut tag).is_ok()
+}
 
 pub struct HeaderProtectionKey(aes::Aes256);
 
@@ -667,7 +683,21 @@ impl crypto::ServerConfig for ServerConfig {
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
         debug_assert_eq!(version, VERSION);
-        todo!()
+        let (nonce, key) = (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1);
+
+        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
+        pseudo_packet.push(orig_dst_cid.len() as u8);
+        pseudo_packet.extend_from_slice(orig_dst_cid);
+        pseudo_packet.extend_from_slice(packet);
+
+        let key = aes_gcm::Aes128Gcm::new_from_slice(&key[..]).unwrap();
+
+        let tag = key
+            .encrypt_in_place_detached(&nonce.into(), &pseudo_packet, &mut Vec::new())
+            .unwrap();
+        let mut result = [0; 16];
+        result.copy_from_slice(tag.as_ref());
+        result
     }
 }
 
@@ -835,6 +865,8 @@ fn protocol_violation(reason: impl Into<String>) -> TransportError {
 #[cfg(test)]
 mod test {
     use super::*;
+    use quinn_proto::crypto::ServerConfig as _;
+    use rand::RngCore;
 
     fn check_roundtrip(hs: HandshakeData) {
         let bytes = hs.as_bytes();
@@ -871,5 +903,26 @@ mod test {
             server_name: Some("hello".to_string()),
             transport_parameters: TransportParameters::default(),
         });
+    }
+
+    #[test]
+    fn test_retry_tag() {
+        let mut local_private_key = [0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut local_private_key);
+
+        let server_config = ServerConfig {
+            alpn_protocols: vec![b"hello".to_vec()],
+            local_private_key,
+        };
+
+        let dest_cid = ConnectionId::new(&[1, 2, 3]);
+        let mut packet = [0u8; 128];
+        rng.fill_bytes(&mut packet);
+
+        let retry_tag = server_config.retry_tag(VERSION, &dest_cid, &packet);
+
+        // TODO: figure out how to test this
+        // assert!(is_valid_retry(&dest_cid, &packet[..16] retry_tag))
     }
 }
