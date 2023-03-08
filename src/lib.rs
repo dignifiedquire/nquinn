@@ -9,7 +9,6 @@ mod tests {
     use std::sync::Arc;
 
     use rand::RngCore;
-    use snow::resolvers::CryptoResolver;
 
     use crate::rustcrypto::{HandshakeTokenKey, HmacKey};
 
@@ -17,21 +16,13 @@ mod tests {
 
     const TEST_ALPN: &[u8] = b"nquic-test";
 
-    /// Generates a Curve25519 Keypair, as used by noise.
-    fn generate_keypair() -> Box<dyn snow::types::Dh> {
-        let resolver = snow::resolvers::DefaultResolver::default();
-        resolver
-            .resolve_dh(&snow::params::DHChoice::Curve25519)
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn minimal() {
         let (mut server_ep, server_key) = {
             let key = generate_keypair();
             let nquic_server_config = ServerConfig {
                 alpn_protocols: vec![TEST_ALPN.to_vec()],
-                local_private_key: key.privkey().try_into().unwrap(),
+                local_private_key: key.private.clone().try_into().unwrap(),
             };
             let server_config = quinn::ServerConfig::new(
                 Arc::new(nquic_server_config),
@@ -55,8 +46,8 @@ mod tests {
             let key = generate_keypair();
             let nquic_client_config = ClientConfig {
                 alpn_protocols: vec![TEST_ALPN.to_vec()],
-                local_private_key: key.privkey().try_into().unwrap(),
-                remote_public_key: server_key.pubkey().try_into().unwrap(),
+                local_private_key: key.private.clone().try_into().unwrap(),
+                remote_public_key: server_key.public.try_into().unwrap(),
             };
             let mut client_config = quinn::ClientConfig::new(Arc::new(nquic_client_config));
             client_config.version(VERSION);

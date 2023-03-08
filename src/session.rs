@@ -64,24 +64,26 @@ impl crypto::Session for NquicSession {
     }
 
     fn is_handshaking(&self) -> bool {
-        self.handshake.is_some()
+        self.handshake
+            .as_ref()
+            .map(|hs| hs.is_handshake_finished())
+            .unwrap_or(false)
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        println!("[{:?}] read_handshake", self.side);
+        println!("[{:?}] read_handshake {}bytes", self.side, buf.len());
         if let Some(ref mut hs) = self.handshake {
             if self.handshake_data_remote.is_some() {
                 return Err(protocol_violation("remote handshake data already received"));
             }
 
-            let buf_len = buf.len().min(65_535);
-            let mut read_buf = vec![0u8; buf_len];
+            let mut payload = vec![0u8; MAXMSG_LEN];
 
-            match hs.read_message(buf, &mut read_buf) {
+            match hs.read_message(buf, &mut payload) {
                 Ok(n) => {
-                    let payload = &read_buf[..n];
+                    payload.truncate(n);
                     let remote_side = !self.side;
-                    let handshake_data = HandshakeData::from_bytes(payload, remote_side)
+                    let handshake_data = HandshakeData::from_bytes(&payload, remote_side)
                         .map_err(protocol_violation)?;
 
                     match self.side {
@@ -125,10 +127,13 @@ impl crypto::Session for NquicSession {
                         }
                     }
                     self.handshake_data_remote = Some(handshake_data);
-
+                    println!("[{:?}] got handshake data remote", self.side);
                     Ok(true)
                 }
-                Err(e) => Err(protocol_violation(format!("Noise error: {e}"))),
+                Err(e) => {
+                    println!("[{:?}] err: {:?}", self.side, e);
+                    Err(protocol_violation(format!("Noise error: {e}")))
+                }
             }
         } else {
             Err(protocol_violation(format!("unexpected handshake")))
@@ -143,71 +148,73 @@ impl crypto::Session for NquicSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        let hs = self
-            .handshake
-            .as_mut()
-            .expect("unexpected write_handshake during transport");
         println!("[{:?}] write_handshake", self.side);
+        if let Some(ref mut hs) = self.handshake {
+            match self.side {
+                Side::Client => {
+                    if !self.handshake_sent {
+                        // Send handshake request
+                        let response = HandshakeData::Client {
+                            alpn_protocols: self.alpn_protocols.clone(),
+                            transport_parameters: self.params_local.clone(),
+                        };
 
-        match self.side {
-            Side::Client => {
-                if !self.handshake_sent {
-                    // Send handshake request
-                    let response = HandshakeData::Client {
-                        alpn_protocols: self.alpn_protocols.clone(),
-                        transport_parameters: self.params_local.clone(),
-                    };
+                        let payload = response.as_bytes();
+                        buf.resize(MAXMSG_LEN, 0);
+                        let len = hs.write_message(&payload, buf).unwrap();
+                        buf.truncate(len);
+                        println!("[{:?}] wrote handshake message {}bytes", self.side, len);
+                        self.handshake_sent = true;
 
-                    let payload = response.as_bytes();
-                    buf.resize(MAXMSG_LEN, 0);
-                    let len = hs.write_message(&payload, buf).unwrap();
-                    buf.truncate(len);
-                    self.handshake_sent = true;
+                        None
+                    } else if let Some(ref handshake_data_remote) = self.handshake_data_remote {
+                        // Handshake finished.
+                        assert!(hs.is_handshake_finished());
 
-                    None
-                } else if let Some(ref handshake_data_remote) = self.handshake_data_remote {
-                    // Handshake finished.
-                    assert!(hs.is_handshake_finished());
+                        let hs = self.handshake.take().unwrap();
 
-                    let hs = self.handshake.take().unwrap();
+                        // Can not use `StatelessTransportMode` directly, so split manually.
 
-                    // Can not use `StatelessTransportMode` directly, so split manually.
+                        let keys = keys_from_handshake_state(hs);
+                        println!("[{:?}] generated secure keys", self.side);
+                        Some(keys)
+                    } else {
+                        None
+                    }
+                }
+                Side::Server => {
+                    assert!(!hs.is_initiator());
+                    if !self.handshake_sent {
+                        // On the server side nothing todo in the first round.
+                        self.handshake_sent = true;
+                        None
+                    } else {
+                        // Send handshake response.
+                        assert!(self.handshake_data_remote.is_some());
+                        // respond
+                        let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
+                        let response = HandshakeData::Server {
+                            alpn_protocol: handshake_data_remote
+                                .select_alpn_protocol(&self.alpn_protocols),
+                            server_name: None, // TODO:
+                            transport_parameters: self.params_local.clone(),
+                        };
 
-                    let keys = keys_from_handshake_state(hs);
-                    Some(keys)
-                } else {
-                    None
+                        let payload = response.as_bytes();
+                        buf.resize(MAXMSG_LEN, 0);
+                        let len = hs.write_message(&payload, buf).unwrap();
+                        buf.truncate(len);
+                        assert!(hs.is_handshake_finished());
+
+                        let hs = self.handshake.take().unwrap();
+                        let keys = keys_from_handshake_state(hs);
+                        println!("[{:?}] generated secure keys", self.side);
+                        Some(keys)
+                    }
                 }
             }
-            Side::Server => {
-                assert!(!hs.is_initiator());
-                if !self.handshake_sent {
-                    // On the server side nothing todo in the first round.
-                    self.handshake_sent = true;
-                    None
-                } else {
-                    // Send handshake response.
-                    assert!(self.handshake_data_remote.is_some());
-                    // respond
-                    let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
-                    let response = HandshakeData::Server {
-                        alpn_protocol: handshake_data_remote
-                            .select_alpn_protocol(&self.alpn_protocols),
-                        server_name: None, // TODO:
-                        transport_parameters: self.params_local.clone(),
-                    };
-
-                    let payload = response.as_bytes();
-                    buf.resize(MAXMSG_LEN, 0);
-                    let len = hs.write_message(&payload, buf).unwrap();
-                    buf.truncate(len);
-                    assert!(hs.is_handshake_finished());
-
-                    let hs = self.handshake.take().unwrap();
-                    let keys = keys_from_handshake_state(hs);
-                    Some(keys)
-                }
-            }
+        } else {
+            None
         }
     }
 
@@ -480,8 +487,11 @@ impl HandshakeData {
             Side::Client => {
                 // transport params
                 let transport_parameters =
-                    TransportParameters::read(side, &mut std::io::Cursor::new(&bytes[pos..]))
-                        .map_err(|_| "invalid transport parameters")?;
+                    TransportParameters::read(!side, &mut std::io::Cursor::new(&bytes[pos..]))
+                        .map_err(|e| {
+                            dbg!(e);
+                            "invalid transport parameters"
+                        })?;
 
                 Ok(HandshakeData::Client {
                     alpn_protocols,
@@ -503,8 +513,11 @@ impl HandshakeData {
 
                 // transport params
                 let transport_parameters =
-                    TransportParameters::read(side, &mut std::io::Cursor::new(&bytes[pos..]))
-                        .map_err(|_| "invalid transport parameters")?;
+                    TransportParameters::read(!side, &mut std::io::Cursor::new(&bytes[pos..]))
+                        .map_err(|e| {
+                            dbg!(e);
+                            "invalid transport parameters"
+                        })?;
 
                 Ok(HandshakeData::Server {
                     alpn_protocol: alpn_protocols.pop(),
@@ -637,6 +650,7 @@ impl crypto::ClientConfig for ClientConfig {
             .remote_public_key(&self.remote_public_key)
             .build_initiator()
             .unwrap();
+
         Ok(Box::new(NquicSession {
             handshake: Some(handshake),
             handshake_data_remote: None,
@@ -731,10 +745,13 @@ const MAXMSG_LEN: usize = 65_535;
 impl crypto::PacketKey for PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
         let (header, payload) = buf.split_at_mut(header_len);
+        assert!(payload.len() <= MAXMSG_LEN);
 
-        assert!(header.len() + TAG_LEN <= MAXMSG_LEN && header.len() + TAG_LEN <= payload.len());
+        let payload_in = payload[..payload.len() - TAG_LEN].to_vec(); // TODO: avoid
 
-        self.cipher.encrypt(packet, &[], &*header, payload);
+        // dbg!("encrypt", hex::encode(&header), hex::encode(&payload_in));
+
+        self.cipher.encrypt(packet, &header, &payload_in, payload);
     }
 
     fn decrypt(
@@ -743,11 +760,13 @@ impl crypto::PacketKey for PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
+        let payload_in = payload.to_vec(); // TODO: avoid
         let plain_len = self
             .cipher
-            .decrypt(packet, &[], header, payload.as_mut())
+            .decrypt(packet, header, &payload_in, payload.as_mut())
             .map_err(|_| CryptoError)?;
         payload.truncate(plain_len);
+        // dbg!("decrypt", hex::encode(header), hex::encode(payload));
         Ok(())
     }
 
@@ -869,6 +888,13 @@ fn protocol_violation(reason: impl Into<String>) -> TransportError {
     }
 }
 
+/// Helper to generate static keypairs
+pub fn generate_keypair() -> snow::Keypair {
+    snow::Builder::new(PATTERN.parse().unwrap())
+        .generate_keypair()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -931,5 +957,37 @@ mod test {
 
         // TODO: figure out how to test this
         // assert!(is_valid_retry(&dest_cid, &packet[..16] retry_tag))
+    }
+
+    #[test]
+    fn test_handshake() {
+        let builder = || snow::Builder::new(PATTERN.parse().unwrap());
+
+        let key_r = generate_keypair();
+        let key_i = generate_keypair();
+
+        let mut handshake_i = builder()
+            .local_private_key(&key_i.private)
+            .remote_public_key(&key_r.public)
+            .build_initiator()
+            .unwrap();
+
+        let mut handshake_r = builder()
+            .local_private_key(&key_r.private)
+            .build_responder()
+            .unwrap();
+
+        let mut buf = vec![0u8; MAXMSG_LEN];
+        let l = handshake_i.write_message(b"hello", &mut buf).unwrap();
+        let mut out_buf = vec![0u8; MAXMSG_LEN];
+        let r = handshake_r.read_message(&buf[..l], &mut out_buf).unwrap();
+        assert_eq!(&out_buf[..r], b"hello");
+
+        let l = handshake_r.write_message(&[], &mut buf).unwrap();
+        let r = handshake_i.read_message(&buf[..l], &mut out_buf).unwrap();
+        assert_eq!(r, 0);
+
+        assert!(handshake_i.is_handshake_finished());
+        assert!(handshake_r.is_handshake_finished());
     }
 }
