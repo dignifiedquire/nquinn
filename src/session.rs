@@ -148,7 +148,10 @@ impl crypto::Session for NquicSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        println!("[{:?}] write_handshake", self.side);
+        println!(
+            "[{:?}] write_handshake {} sent",
+            self.side, self.handshake_sent
+        );
         if let Some(ref mut hs) = self.handshake {
             match self.side {
                 Side::Client => {
@@ -175,7 +178,7 @@ impl crypto::Session for NquicSession {
 
                         // Can not use `StatelessTransportMode` directly, so split manually.
 
-                        let keys = keys_from_handshake_state(hs);
+                        let keys = keys_from_handshake_state(hs, self.side);
                         println!("[{:?}] generated secure keys", self.side);
                         Some(keys)
                     } else {
@@ -207,7 +210,7 @@ impl crypto::Session for NquicSession {
                         assert!(hs.is_handshake_finished());
 
                         let hs = self.handshake.take().unwrap();
-                        let keys = keys_from_handshake_state(hs);
+                        let keys = keys_from_handshake_state(hs, self.side);
                         println!("[{:?}] generated secure keys", self.side);
                         Some(keys)
                     }
@@ -729,6 +732,7 @@ pub struct PacketKey {
 
 impl PacketKey {
     fn from_secret(secret: &[u8]) -> Self {
+        println!("generating new packet key {:?}", &secret[..4]);
         let resolver = snow::resolvers::DefaultResolver::default();
         let mut cipher = resolver
             .resolve_cipher(&snow::params::CipherChoice::AESGCM)
@@ -744,13 +748,13 @@ const MAXMSG_LEN: usize = 65_535;
 
 impl crypto::PacketKey for PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+        println!("encrypt {}, {}bytes", packet, buf.len() - header_len);
         let (header, payload) = buf.split_at_mut(header_len);
         assert!(payload.len() <= MAXMSG_LEN);
 
         let payload_in = payload[..payload.len() - TAG_LEN].to_vec(); // TODO: avoid
 
         // dbg!("encrypt", hex::encode(&header), hex::encode(&payload_in));
-
         self.cipher.encrypt(packet, &header, &payload_in, payload);
     }
 
@@ -760,6 +764,7 @@ impl crypto::PacketKey for PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
+        println!("decrypt {}, {}bytes", packet, payload.len());
         let payload_in = payload.to_vec(); // TODO: avoid
         let plain_len = self
             .cipher
@@ -859,8 +864,15 @@ fn hkdf_expand(prk: &[u8], label: &[u8], context: &[u8]) -> [u8; OKM_SIZE] {
     out
 }
 
-fn keys_from_handshake_state(mut hs: snow::HandshakeState) -> Keys {
-    let (local_secret, remote_secret) = hs.dangerously_get_raw_split();
+fn keys_from_handshake_state(mut hs: snow::HandshakeState, side: Side) -> Keys {
+    let (left_secret, right_secret) = hs.dangerously_get_raw_split();
+    let (local_secret, remote_secret) = match side {
+        Side::Client => {
+            // Initiator
+            (left_secret, right_secret)
+        }
+        Side::Server => (right_secret, left_secret),
+    };
 
     let header_local = HeaderProtectionKey::from_secret(&local_secret);
     let header_remote = HeaderProtectionKey::from_secret(&remote_secret);
