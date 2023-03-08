@@ -23,8 +23,8 @@ const STATIC_DUMMY_SECRET: [u8; 32] = [
 
 /// A nquic session
 pub struct NquicSession {
-    /// noise snow session
-    session: Option<snow::HandshakeState>,
+    /// Noise handshake data.
+    handshake: Option<snow::HandshakeState>,
     /// Authenticated remote handshake data.
     handshake_data_remote: Option<HandshakeData>,
     /// Local transport parameters
@@ -48,7 +48,8 @@ impl crypto::Session for NquicSession {
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        todo!()
+        // TODO: what should this be?
+        None
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
@@ -60,11 +61,11 @@ impl crypto::Session for NquicSession {
     }
 
     fn is_handshaking(&self) -> bool {
-        self.session.is_some()
+        self.handshake.is_some()
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        if let Some(ref mut hs) = self.session {
+        if let Some(ref mut hs) = self.handshake {
             if self.handshake_data_remote.is_some() {
                 return Err(protocol_violation("remote handshake data already received"));
             }
@@ -76,7 +77,8 @@ impl crypto::Session for NquicSession {
                 Ok(n) => {
                     let payload = &read_buf[..n];
                     let remote_side = !self.side;
-                    let handshake_data = HandshakeData::from_bytes(payload, remote_side)?;
+                    let handshake_data = HandshakeData::from_bytes(payload, remote_side)
+                        .map_err(protocol_violation)?;
 
                     match self.side {
                         Side::Client => {
@@ -137,7 +139,7 @@ impl crypto::Session for NquicSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        if let Some(ref mut hs) = self.session {
+        if let Some(ref mut hs) = self.handshake {
             match self.side {
                 Side::Client => {
                     if !self.handshake_sent {
@@ -158,7 +160,7 @@ impl crypto::Session for NquicSession {
                         assert!(hs.is_handshake_finished());
 
                         drop(hs);
-                        let mut hs = self.session.take().unwrap();
+                        let mut hs = self.handshake.take().unwrap();
 
                         // Can not use `StatelessTransportMode` directly, so split manually.
 
@@ -189,7 +191,7 @@ impl crypto::Session for NquicSession {
                         assert!(hs.is_handshake_finished());
 
                         drop(hs);
-                        let hs = self.session.take().unwrap();
+                        let hs = self.handshake.take().unwrap();
                         let keys = keys_from_handshake_state(hs);
                         Some(keys)
                     }
@@ -385,7 +387,7 @@ impl crypto::HeaderKey for HeaderProtectionKey {
 }
 
 /// Authentication data for a snow session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeData {
     /// The data sent by the client -> server
     Client {
@@ -406,12 +408,150 @@ pub enum HandshakeData {
 }
 
 impl HandshakeData {
-    fn from_bytes(bytes: &[u8], side: Side) -> Result<Self, TransportError> {
-        todo!()
+    fn side(&self) -> Side {
+        match self {
+            HandshakeData::Client { .. } => Side::Client,
+            HandshakeData::Server { .. } => Side::Server,
+        }
+    }
+    fn from_bytes(bytes: &[u8], side: Side) -> Result<Self, &'static str> {
+        fn read<I: std::slice::SliceIndex<[u8]>>(
+            bytes: &[u8],
+            pos: I,
+        ) -> Result<&I::Output, &'static str> {
+            bytes.get(pos).ok_or_else(|| "unexpected eof")
+        }
+        let mut pos = 0;
+
+        // Side
+        let side_byte = *read(bytes, pos)?;
+        match (side_byte, side) {
+            (0, Side::Client) | (1, Side::Server) => {
+                // all good
+            }
+            (_, _) => {
+                return Err("side missmatch");
+            }
+        }
+        pos += 1;
+
+        // Protocols
+        let num_alpn_protocols = *read(bytes, pos)? as usize;
+        pos += 1;
+
+        if side == Side::Server && num_alpn_protocols > 1 {
+            return Err("too many ALPN protocols");
+        }
+
+        let mut alpn_protocols = Vec::with_capacity(num_alpn_protocols);
+        for _ in 0..num_alpn_protocols {
+            let len = *read(bytes, pos)? as usize;
+            pos += 1;
+            let protocol = read(bytes, pos..pos + len)?.to_vec();
+            alpn_protocols.push(protocol);
+            pos += len;
+        }
+
+        match side {
+            Side::Client => {
+                // transport params
+                let transport_parameters =
+                    TransportParameters::read(side, &mut std::io::Cursor::new(&bytes[pos..]))
+                        .map_err(|_| "invalid transport parameters")?;
+
+                Ok(HandshakeData::Client {
+                    alpn_protocols,
+                    transport_parameters,
+                })
+            }
+            Side::Server => {
+                let server_name_len = *read(bytes, pos)? as usize;
+                pos += 1;
+                let server_name = if server_name_len == 0 {
+                    None
+                } else {
+                    let name_raw = read(bytes, pos..pos + server_name_len)?;
+                    pos += server_name_len;
+                    let name_str =
+                        std::str::from_utf8(name_raw).map_err(|_| "invalid servername")?;
+                    Some(name_str.to_string())
+                };
+
+                // transport params
+                let transport_parameters =
+                    TransportParameters::read(side, &mut std::io::Cursor::new(&bytes[pos..]))
+                        .map_err(|_| "invalid transport parameters")?;
+
+                Ok(HandshakeData::Server {
+                    alpn_protocol: alpn_protocols.pop(),
+                    server_name,
+                    transport_parameters,
+                })
+            }
+        }
     }
 
     fn as_bytes(&self) -> Vec<u8> {
-        todo!()
+        let mut out = Vec::new();
+
+        match self {
+            HandshakeData::Client {
+                ref alpn_protocols,
+                ref transport_parameters,
+            } => {
+                // Side
+                out.push(0);
+
+                // ALPN
+                out.push(u8::try_from(alpn_protocols.len()).expect("too many protocols"));
+                for protocol in alpn_protocols {
+                    // length prefix
+                    out.push(u8::try_from(protocol.len()).expect("protocol name too large"));
+                    out.extend_from_slice(protocol);
+                }
+
+                // transport parameters
+                transport_parameters.write(&mut out);
+            }
+            HandshakeData::Server {
+                ref alpn_protocol,
+                ref server_name,
+                ref transport_parameters,
+            } => {
+                // Side
+                out.push(1);
+
+                // ALPN
+                match alpn_protocol {
+                    None => {
+                        out.push(0);
+                    }
+                    Some(protocol) => {
+                        out.push(1);
+                        // length prefix
+                        out.push(u8::try_from(protocol.len()).expect("protocol name too large"));
+                        out.extend_from_slice(protocol);
+                    }
+                }
+
+                // Server Name
+                match server_name {
+                    None => {
+                        out.push(0);
+                    }
+                    Some(name) => {
+                        // length prefix
+                        out.push(u8::try_from(name.len()).expect("server name too large"));
+                        out.extend_from_slice(name.as_bytes());
+                    }
+                }
+
+                // transport parameters
+                transport_parameters.write(&mut out);
+            }
+        }
+
+        out
     }
 
     fn transport_parameters(&self) -> &TransportParameters {
@@ -474,7 +614,7 @@ impl crypto::ClientConfig for ClientConfig {
             .build_initiator()
             .unwrap();
         Ok(Box::new(NquicSession {
-            session: Some(handshake),
+            handshake: Some(handshake),
             handshake_data_remote: None,
             params_local: params.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
@@ -504,7 +644,7 @@ impl crypto::ServerConfig for ServerConfig {
             .build_responder()
             .unwrap();
         Box::new(NquicSession {
-            session: Some(handshake),
+            handshake: Some(handshake),
             handshake_data_remote: None,
             params_local: params.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
@@ -689,5 +829,47 @@ fn protocol_violation(reason: impl Into<String>) -> TransportError {
         code: TransportErrorCode::PROTOCOL_VIOLATION,
         frame: None,
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn check_roundtrip(hs: HandshakeData) {
+        let bytes = hs.as_bytes();
+        let back = HandshakeData::from_bytes(&bytes, hs.side()).unwrap();
+        assert_eq!(hs, back);
+    }
+
+    #[test]
+    fn test_handshake_data_roundtrip() {
+        check_roundtrip(HandshakeData::Client {
+            alpn_protocols: vec![],
+            transport_parameters: TransportParameters::default(),
+        });
+
+        check_roundtrip(HandshakeData::Client {
+            alpn_protocols: vec![b"hello".to_vec(), b"world".to_vec()],
+            transport_parameters: TransportParameters::default(),
+        });
+
+        check_roundtrip(HandshakeData::Server {
+            alpn_protocol: None,
+            server_name: None,
+            transport_parameters: TransportParameters::default(),
+        });
+
+        check_roundtrip(HandshakeData::Server {
+            alpn_protocol: None,
+            server_name: Some("hello".to_string()),
+            transport_parameters: TransportParameters::default(),
+        });
+
+        check_roundtrip(HandshakeData::Server {
+            alpn_protocol: Some(b"hello".to_vec()),
+            server_name: Some("hello".to_string()),
+            transport_parameters: TransportParameters::default(),
+        });
     }
 }
