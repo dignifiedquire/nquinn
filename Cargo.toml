@@ -16,5 +16,6 @@ rand = "0.8.5"
 aes-gcm = "0.9"
 
 [dev-dependencies]
+hex = "0.4.3"
 quinn = { version = "0.9.3", default-features = false, features = ["runtime-tokio"] }
 tokio = { version = "1.26.0", features = ["full"] }

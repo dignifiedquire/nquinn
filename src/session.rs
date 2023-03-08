@@ -14,7 +14,7 @@ use quinn_proto::{
 };
 
 /// Version number based on the original version suggested by the nQuic paper.
-const VERSION: u32 = 0xff00000b;
+pub const VERSION: u32 = 0xff00000b;
 
 const PATTERN: &str = "Noise_IK_25519_AESGCM_SHA256";
 const STATIC_DUMMY_SECRET: [u8; 32] = [
@@ -54,11 +54,13 @@ impl crypto::Session for NquicSession {
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
-        todo!()
+        // TODO:
+        None
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        todo!()
+        // TODO:
+        None
     }
 
     fn is_handshaking(&self) -> bool {
@@ -66,6 +68,7 @@ impl crypto::Session for NquicSession {
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        println!("[{:?}] read_handshake", self.side);
         if let Some(ref mut hs) = self.handshake {
             if self.handshake_data_remote.is_some() {
                 return Err(protocol_violation("remote handshake data already received"));
@@ -140,66 +143,71 @@ impl crypto::Session for NquicSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        if let Some(ref mut hs) = self.handshake {
-            match self.side {
-                Side::Client => {
-                    if !self.handshake_sent {
-                        // Send handshake request
-                        let response = HandshakeData::Client {
-                            alpn_protocols: self.alpn_protocols.clone(),
-                            transport_parameters: self.params_local.clone(),
-                        };
+        let hs = self
+            .handshake
+            .as_mut()
+            .expect("unexpected write_handshake during transport");
+        println!("[{:?}] write_handshake", self.side);
 
-                        let payload = response.as_bytes();
-                        let len = hs.write_message(&payload, buf).unwrap();
-                        self.handshake_sent = true;
+        match self.side {
+            Side::Client => {
+                if !self.handshake_sent {
+                    // Send handshake request
+                    let response = HandshakeData::Client {
+                        alpn_protocols: self.alpn_protocols.clone(),
+                        transport_parameters: self.params_local.clone(),
+                    };
 
-                        None
-                    } else {
-                        // Handshake finished.
-                        assert!(self.handshake_data_remote.is_some());
-                        assert!(hs.is_handshake_finished());
+                    let payload = response.as_bytes();
+                    buf.resize(MAXMSG_LEN, 0);
+                    let len = hs.write_message(&payload, buf).unwrap();
+                    buf.truncate(len);
+                    self.handshake_sent = true;
 
-                        drop(hs);
-                        let mut hs = self.handshake.take().unwrap();
+                    None
+                } else if let Some(ref handshake_data_remote) = self.handshake_data_remote {
+                    // Handshake finished.
+                    assert!(hs.is_handshake_finished());
 
-                        // Can not use `StatelessTransportMode` directly, so split manually.
+                    let hs = self.handshake.take().unwrap();
 
-                        let keys = keys_from_handshake_state(hs);
-                        Some(keys)
-                    }
-                }
-                Side::Server => {
-                    assert!(!hs.is_initiator());
-                    if !self.handshake_sent {
-                        // On the server side nothing todo in the first round.
-                        self.handshake_sent = true;
-                        None
-                    } else {
-                        // Send handshake response.
-                        assert!(self.handshake_data_remote.is_some());
-                        // respond
-                        let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
-                        let response = HandshakeData::Server {
-                            alpn_protocol: handshake_data_remote
-                                .select_alpn_protocol(&self.alpn_protocols),
-                            server_name: None, // TODO:
-                            transport_parameters: self.params_local.clone(),
-                        };
+                    // Can not use `StatelessTransportMode` directly, so split manually.
 
-                        let payload = response.as_bytes();
-                        let len = hs.write_message(&payload, buf).unwrap();
-                        assert!(hs.is_handshake_finished());
-
-                        drop(hs);
-                        let hs = self.handshake.take().unwrap();
-                        let keys = keys_from_handshake_state(hs);
-                        Some(keys)
-                    }
+                    let keys = keys_from_handshake_state(hs);
+                    Some(keys)
+                } else {
+                    None
                 }
             }
-        } else {
-            panic!("unexpected write_handshake during transport");
+            Side::Server => {
+                assert!(!hs.is_initiator());
+                if !self.handshake_sent {
+                    // On the server side nothing todo in the first round.
+                    self.handshake_sent = true;
+                    None
+                } else {
+                    // Send handshake response.
+                    assert!(self.handshake_data_remote.is_some());
+                    // respond
+                    let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
+                    let response = HandshakeData::Server {
+                        alpn_protocol: handshake_data_remote
+                            .select_alpn_protocol(&self.alpn_protocols),
+                        server_name: None, // TODO:
+                        transport_parameters: self.params_local.clone(),
+                    };
+
+                    let payload = response.as_bytes();
+                    buf.resize(MAXMSG_LEN, 0);
+                    let len = hs.write_message(&payload, buf).unwrap();
+                    buf.truncate(len);
+                    assert!(hs.is_handshake_finished());
+
+                    let hs = self.handshake.take().unwrap();
+                    let keys = keys_from_handshake_state(hs);
+                    Some(keys)
+                }
+            }
         }
     }
 
@@ -701,9 +709,8 @@ impl crypto::ServerConfig for ServerConfig {
     }
 }
 
-#[derive(Default)]
 pub struct PacketKey {
-    cipher: Option<Box<dyn snow::types::Cipher>>,
+    cipher: Box<dyn snow::types::Cipher>,
 }
 
 impl PacketKey {
@@ -713,9 +720,7 @@ impl PacketKey {
             .resolve_cipher(&snow::params::CipherChoice::AESGCM)
             .unwrap();
         cipher.set(secret);
-        PacketKey {
-            cipher: Some(cipher),
-        }
+        PacketKey { cipher }
     }
 }
 
@@ -725,12 +730,11 @@ const MAXMSG_LEN: usize = 65_535;
 
 impl crypto::PacketKey for PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
-        let cipher = self.cipher.as_ref().expect("handshake not completed");
         let (header, payload) = buf.split_at_mut(header_len);
 
         assert!(header.len() + TAG_LEN <= MAXMSG_LEN && header.len() + TAG_LEN <= payload.len());
 
-        cipher.encrypt(packet, &[], &*header, payload);
+        self.cipher.encrypt(packet, &[], &*header, payload);
     }
 
     fn decrypt(
@@ -739,8 +743,8 @@ impl crypto::PacketKey for PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let cipher = self.cipher.as_ref().expect("handshake not completed");
-        let plain_len = cipher
+        let plain_len = self
+            .cipher
             .decrypt(packet, &[], header, payload.as_mut())
             .map_err(|_| CryptoError)?;
         payload.truncate(plain_len);
@@ -790,7 +794,10 @@ pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> 
         HeaderProtectionKey::from_secret(remote_secret),
     );
 
-    let (packet_local, packet_remote) = (PacketKey::default(), PacketKey::default());
+    let (packet_local, packet_remote) = (
+        PacketKey::from_secret(local_secret),
+        PacketKey::from_secret(remote_secret),
+    );
 
     Keys {
         header: KeyPair {
