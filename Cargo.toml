@@ -14,8 +14,10 @@ aes = { version = "0.8" }
 bytes = "1.4.0"
 rand = "0.8.5"
 aes-gcm = "0.9"
-hex = "0.4.3"
 
 [dev-dependencies]
 quinn = { version = "0.9.3", default-features = false, features = ["runtime-tokio"] }
 tokio = { version = "1.26.0", features = ["full"] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+hex = "0.4.3"
+

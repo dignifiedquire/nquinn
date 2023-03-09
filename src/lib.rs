@@ -14,10 +14,17 @@ mod tests {
 
     use super::*;
 
+    use tracing_subscriber::{prelude::*, EnvFilter};
+
     const TEST_ALPN: &[u8] = b"nquic-test";
 
     #[tokio::test]
     async fn minimal() {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .with(EnvFilter::from_default_env())
+            .init();
+
         let (mut server_ep, server_key) = {
             let key = generate_keypair();
             let nquic_server_config = ServerConfig {

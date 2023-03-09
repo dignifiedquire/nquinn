@@ -792,13 +792,11 @@ const MAXMSG_LEN: usize = 65_535;
 
 impl crypto::PacketKey for PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
-        println!("encrypt {}, {}bytes", packet, buf.len() - header_len);
         let (header, payload) = buf.split_at_mut(header_len);
         assert!(payload.len() <= MAXMSG_LEN);
 
         let payload_in = payload[..payload.len() - TAG_LEN].to_vec(); // TODO: avoid
 
-        // dbg!("encrypt", hex::encode(&header), hex::encode(&payload_in));
         self.cipher.encrypt(packet, &header, &payload_in, payload);
     }
 
@@ -808,14 +806,12 @@ impl crypto::PacketKey for PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        println!("decrypt {}, {}bytes", packet, payload.len());
         let payload_in = payload.to_vec(); // TODO: avoid
         let plain_len = self
             .cipher
             .decrypt(packet, header, &payload_in, payload.as_mut())
             .map_err(|_| CryptoError)?;
         payload.truncate(plain_len);
-        // dbg!("decrypt", hex::encode(header), hex::encode(payload));
         Ok(())
     }
 
