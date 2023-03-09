@@ -35,6 +35,9 @@ pub struct NquicSession {
     alpn_protocols: Vec<Vec<u8>>,
     side: Side,
     handshake_sent: bool,
+    handshake_keys_generated: bool,
+    /// Set of next sedcrets to use.
+    next_secrets: Option<Secret>,
 }
 
 impl crypto::Session for NquicSession {
@@ -149,49 +152,81 @@ impl crypto::Session for NquicSession {
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
         println!(
-            "[{:?}] write_handshake {} sent",
-            self.side, self.handshake_sent
+            "[{:?}] write_handshake {} {} {:?}",
+            self.side,
+            self.handshake_sent,
+            self.handshake_data_remote.is_some(),
+            self.handshake.as_ref().map(|s| s.is_handshake_finished()),
         );
         if let Some(ref mut hs) = self.handshake {
             match self.side {
                 Side::Client => {
-                    if !self.handshake_sent {
-                        // Send handshake request
-                        let response = HandshakeData::Client {
-                            alpn_protocols: self.alpn_protocols.clone(),
-                            transport_parameters: self.params_local.clone(),
-                        };
-
-                        let payload = response.as_bytes();
+                    if hs.is_my_turn() && !hs.is_handshake_finished() {
                         buf.resize(MAXMSG_LEN, 0);
-                        let len = hs.write_message(&payload, buf).unwrap();
+                        let len = if self.handshake_sent {
+                            hs.write_message(&[], buf).unwrap()
+                        } else {
+                            // Send handshake request
+                            let response = HandshakeData::Client {
+                                alpn_protocols: self.alpn_protocols.clone(),
+                                transport_parameters: self.params_local.clone(),
+                            };
+                            let payload = response.as_bytes();
+                            let len = hs.write_message(&payload, buf).unwrap();
+                            self.handshake_sent = true;
+                            len
+                        };
                         buf.truncate(len);
-                        println!("[{:?}] wrote handshake message {}bytes", self.side, len);
-                        self.handshake_sent = true;
 
-                        None
-                    } else if let Some(ref handshake_data_remote) = self.handshake_data_remote {
+                        println!("[{:?}] wrote handshake message {}bytes", self.side, len);
+                    }
+
+                    if self.handshake_sent
+                        && self.handshake_data_remote.is_none()
+                        && !self.handshake_keys_generated
+                    {
+                        // Initial hello sent out
+                        // Quinn expects its own Handshake set of keys so generate these.
+
+                        println!("[{:?}] generated handshake keys", self.side);
+                        self.handshake_keys_generated = true;
+                        // TODO: these are very likely not the keys we want to use, figure out a better construction
+                        return Some(initial_keys(
+                            VERSION,
+                            &ConnectionId::new(&[0u8; 8]),
+                            self.side,
+                        ));
+                    }
+
+                    if self.handshake_data_remote.is_some() && hs.is_handshake_finished() {
                         // Handshake finished.
-                        assert!(hs.is_handshake_finished());
+                        // We can now generate the final data keys.
 
                         let hs = self.handshake.take().unwrap();
 
-                        // Can not use `StatelessTransportMode` directly, so split manually.
-
-                        let keys = keys_from_handshake_state(hs, self.side);
+                        let (keys, next_secrets) = keys_from_handshake_state(hs, self.side);
                         println!("[{:?}] generated secure keys", self.side);
-                        Some(keys)
-                    } else {
-                        None
+                        self.next_secrets = Some(next_secrets);
+                        return Some(keys);
                     }
                 }
                 Side::Server => {
                     assert!(!hs.is_initiator());
-                    if !self.handshake_sent {
-                        // On the server side nothing todo in the first round.
-                        self.handshake_sent = true;
-                        None
-                    } else {
+                    if !self.handshake_keys_generated {
+                        // Initial hello sent out
+                        // Quinn expects its own Handshake set of keys so generate these.
+
+                        println!("[{:?}] generated handshake keys", self.side);
+                        self.handshake_keys_generated = true;
+                        // TODO: these are very likely not the keys we want to use, figure out a better construction
+                        return Some(initial_keys(
+                            VERSION,
+                            &ConnectionId::new(&[0u8; 8]),
+                            self.side,
+                        ));
+                    }
+
+                    if self.handshake_data_remote.is_some() && hs.is_my_turn() {
                         // Send handshake response.
                         assert!(self.handshake_data_remote.is_some());
                         // respond
@@ -210,19 +245,23 @@ impl crypto::Session for NquicSession {
                         assert!(hs.is_handshake_finished());
 
                         let hs = self.handshake.take().unwrap();
-                        let keys = keys_from_handshake_state(hs, self.side);
+                        let (keys, next_secrets) = keys_from_handshake_state(hs, self.side);
                         println!("[{:?}] generated secure keys", self.side);
-                        Some(keys)
+                        self.next_secrets = Some(next_secrets);
+                        return Some(keys);
                     }
                 }
             }
-        } else {
-            None
         }
+
+        None
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn crypto::PacketKey>>> {
-        todo!()
+        let secrets = self.next_secrets.as_mut()?;
+        let keys = secrets.next_packet_keys();
+
+        Some(keys)
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
@@ -661,6 +700,8 @@ impl crypto::ClientConfig for ClientConfig {
             alpn_protocols: self.alpn_protocols.clone(),
             side: Side::Client,
             handshake_sent: false,
+            handshake_keys_generated: false,
+            next_secrets: None,
         }))
     }
 }
@@ -691,6 +732,8 @@ impl crypto::ServerConfig for ServerConfig {
             alpn_protocols: self.alpn_protocols.clone(),
             side: Side::Server,
             handshake_sent: false,
+            handshake_keys_generated: false,
+            next_secrets: None,
         })
     }
 
@@ -732,12 +775,13 @@ pub struct PacketKey {
 
 impl PacketKey {
     fn from_secret(secret: &[u8]) -> Self {
-        println!("generating new packet key {:?}", &secret[..4]);
         let resolver = snow::resolvers::DefaultResolver::default();
         let mut cipher = resolver
             .resolve_cipher(&snow::params::CipherChoice::AESGCM)
             .unwrap();
-        cipher.set(secret);
+
+        let secret = hkdf_expand(secret, b"quic key", &[]);
+        cipher.set(&secret);
         PacketKey { cipher }
     }
 }
@@ -795,6 +839,8 @@ impl crypto::PacketKey for PacketKey {
 /// The algorithm follows Quic TLS RFC 9001 Section 5.1.
 /// To reduce the amount of different algorihtms used this uses AES GCM 256 and not 128 as the TLS spec.
 pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> Keys {
+    debug_assert_eq!(version, VERSION);
+
     const CLIENT_LABEL: &[u8] = b"client in";
     const SERVER_LABEL: &[u8] = b"server in";
 
@@ -808,30 +854,68 @@ pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> 
     let client_secret = hkdf_expand(&hs_secret, CLIENT_LABEL, &[]);
     let server_secret = hkdf_expand(&hs_secret, SERVER_LABEL, &[]);
 
-    let (local_secret, remote_secret) = match side {
-        Side::Client => (&client_secret, &server_secret),
-        Side::Server => (&server_secret, &client_secret),
-    };
+    new_keys(&Secret {
+        client: client_secret,
+        server: server_secret,
+        side,
+    })
+}
 
+fn new_keys(secret: &Secret) -> Keys {
+    let (local, remote) = secret.local_remote();
     let (header_local, header_remote) = (
-        HeaderProtectionKey::from_secret(local_secret),
-        HeaderProtectionKey::from_secret(remote_secret),
+        HeaderProtectionKey::from_secret(local),
+        HeaderProtectionKey::from_secret(remote),
     );
 
-    let (packet_local, packet_remote) = (
-        PacketKey::from_secret(local_secret),
-        PacketKey::from_secret(remote_secret),
-    );
-
+    let packet = new_packet_keys(secret);
     Keys {
         header: KeyPair {
             local: Box::new(header_local),
             remote: Box::new(header_remote),
         },
-        packet: KeyPair {
-            local: Box::new(packet_local),
-            remote: Box::new(packet_remote),
-        },
+        packet,
+    }
+}
+
+fn new_packet_keys(secret: &Secret) -> KeyPair<Box<dyn crypto::PacketKey>> {
+    let (local, remote) = secret.local_remote();
+    let (packet_local, packet_remote) = (
+        PacketKey::from_secret(local),
+        PacketKey::from_secret(remote),
+    );
+    KeyPair {
+        local: Box::new(packet_local),
+        remote: Box::new(packet_remote),
+    }
+}
+
+struct Secret {
+    client: [u8; 32],
+    server: [u8; 32],
+    side: Side,
+}
+
+impl Secret {
+    fn local_remote(&self) -> (&[u8; 32], &[u8; 32]) {
+        match self.side {
+            Side::Client => (&self.client, &self.server),
+            Side::Server => (&self.server, &self.client),
+        }
+    }
+
+    fn next_packet_keys(&mut self) -> KeyPair<Box<dyn crypto::PacketKey>> {
+        let keys = new_packet_keys(&self);
+        self.update();
+        keys
+    }
+
+    fn update(&mut self) {
+        // This is the expansion from TLS
+        // TODO: this should probably be switched to the rekey
+        // method from noise.
+        self.client = hkdf_expand(&self.client, b"quic ku", &[]);
+        self.server = hkdf_expand(&self.server, b"quic ku", &[]);
     }
 }
 
@@ -864,32 +948,18 @@ fn hkdf_expand(prk: &[u8], label: &[u8], context: &[u8]) -> [u8; OKM_SIZE] {
     out
 }
 
-fn keys_from_handshake_state(mut hs: snow::HandshakeState, side: Side) -> Keys {
+fn keys_from_handshake_state(mut hs: snow::HandshakeState, side: Side) -> (Keys, Secret) {
+    // Can not use `StatelessTransportMode` directly, so split manually.
     let (left_secret, right_secret) = hs.dangerously_get_raw_split();
-    let (local_secret, remote_secret) = match side {
-        Side::Client => {
-            // Initiator
-            (left_secret, right_secret)
-        }
-        Side::Server => (right_secret, left_secret),
+
+    let mut secrets = Secret {
+        client: left_secret,
+        server: right_secret,
+        side,
     };
-
-    let header_local = HeaderProtectionKey::from_secret(&local_secret);
-    let header_remote = HeaderProtectionKey::from_secret(&remote_secret);
-
-    let packet_local = PacketKey::from_secret(&local_secret);
-    let packet_remote = PacketKey::from_secret(&remote_secret);
-
-    Keys {
-        header: KeyPair {
-            local: Box::new(header_local),
-            remote: Box::new(header_remote),
-        },
-        packet: KeyPair {
-            local: Box::new(packet_local),
-            remote: Box::new(packet_remote),
-        },
-    }
+    let keys = new_keys(&secrets);
+    secrets.update();
+    (keys, secrets)
 }
 
 fn protocol_violation(reason: impl Into<String>) -> TransportError {
