@@ -101,3 +101,45 @@ impl crypto::AeadKey for AeadKey {
         Ok(&mut data[..tag_pos])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use quinn::crypto::{HandshakeTokenKey as _, HmacKey as _};
+
+    use super::*;
+
+    #[test]
+    fn test_hmac_key() {
+        let mut rng = rand::thread_rng();
+
+        let key = HmacKey::default();
+        let mut data = [0u8; 128];
+        rng.fill_bytes(&mut data);
+
+        let mut signature = vec![0u8; key.signature_len() as usize];
+        key.sign(&data, &mut signature);
+        assert!(key.verify(&data, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_handshake_token_key() {
+        let mut rng = rand::thread_rng();
+
+        let key = HandshakeTokenKey::default();
+        let mut random_bytes = [0u8; 32];
+        rng.fill_bytes(&mut random_bytes);
+
+        let aead_key = key.aead_from_hkdf(&random_bytes);
+
+        let mut data = vec![0u8; 128];
+        rng.fill_bytes(&mut data);
+        let mut add = [0u8; 16];
+        rng.fill_bytes(&mut add);
+
+        let mut sealed = data.clone();
+        aead_key.seal(&mut sealed, &add).unwrap();
+        let unsealed = aead_key.open(&mut sealed, &add).unwrap();
+
+        assert_eq!(data, unsealed);
+    }
+}
