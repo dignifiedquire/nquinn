@@ -249,7 +249,7 @@ impl crypto::Session for NquicSession {
 
                 println!("[{:?}] generated handshake keys", self.side);
 
-                // TODO: these are very likely not the keys we want to use, figure out a better construction
+                // TODO: verify this
                 let (keys, _) = keys_from_handshake_state(hs, self.side);
                 self.state.to_handshake();
                 Some(keys)
