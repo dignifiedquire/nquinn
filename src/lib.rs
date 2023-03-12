@@ -25,11 +25,11 @@ mod tests {
             .with(EnvFilter::from_default_env())
             .init();
 
-        let (mut server_ep, server_key) = {
-            let key = generate_keypair();
+        let (server_ep, server_key) = {
+            let key = DhKeypair::default();
             let nquic_server_config = ServerConfig {
                 alpn_protocols: vec![TEST_ALPN.to_vec()],
-                local_private_key: key.private.clone().try_into().unwrap(),
+                local_private_key: key.private(),
             };
             let server_config = quinn::ServerConfig::new(
                 Arc::new(nquic_server_config),
@@ -49,12 +49,12 @@ mod tests {
             (ep, key)
         };
 
-        let (mut client_ep, client_key) = {
-            let key = generate_keypair();
+        let (client_ep, client_key) = {
+            let key = DhKeypair::default();
             let nquic_client_config = ClientConfig {
                 alpn_protocols: vec![TEST_ALPN.to_vec()],
-                local_private_key: key.private.clone().try_into().unwrap(),
-                remote_public_key: server_key.public.try_into().unwrap(),
+                local_private_key: key.private(),
+                remote_public_key: server_key.public,
             };
             let mut client_config = quinn::ClientConfig::new(Arc::new(nquic_client_config));
             client_config.version(VERSION);

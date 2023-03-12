@@ -1,10 +1,12 @@
+use std::fmt::Debug;
 use std::{any::Any, str, sync::Arc};
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes_gcm::{AeadInPlace, NewAead};
 use bytes::BytesMut;
-use snow::resolvers::CryptoResolver;
-
+use noise_protocol::U8Array;
+use noise_protocol::{Cipher, HandshakeStateBuilder, DH};
+use noise_rust_crypto::{sensitive::Sensitive, Aes256Gcm, Sha256, X25519};
 use quinn_proto::{
     crypto::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
@@ -22,10 +24,10 @@ const STATIC_DUMMY_SECRET: [u8; 32] = [
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 ];
 
+type HandshakeState = noise_protocol::HandshakeState<X25519, Aes256Gcm, Sha256>;
+
 /// A nquic session
 pub struct NquicSession {
-    /// Noise handshake data.
-    handshake: Option<snow::HandshakeState>,
     /// Authenticated remote handshake data.
     handshake_data_remote: Option<HandshakeData>,
     /// Local transport parameters
@@ -34,10 +36,82 @@ pub struct NquicSession {
     /// Ordered by most perferred first.
     alpn_protocols: Vec<Vec<u8>>,
     side: Side,
-    handshake_sent: bool,
-    handshake_keys_generated: bool,
+    state: State,
     /// Set of next sedcrets to use.
     next_secrets: Option<Secret>,
+}
+
+enum State {
+    Initial(HandshakeState),
+    ZeroRtt(HandshakeState),
+    Handshake(HandshakeState),
+    OneRtt(HandshakeState),
+    Data,
+    /// Represents the state of an invalid state transition during panics.
+    Invalid,
+}
+
+impl State {
+    fn get_handshake_state(&self) -> Option<&HandshakeState> {
+        match &self {
+            State::Initial(hs) | State::ZeroRtt(hs) | State::Handshake(hs) | State::OneRtt(hs) => {
+                Some(hs)
+            }
+            State::Data => None,
+            State::Invalid => panic!("state poisend"),
+        }
+    }
+
+    fn to_one_rtt(&mut self) {
+        match std::mem::replace(self, State::Invalid) {
+            State::Handshake(hs) => {
+                *self = State::OneRtt(hs);
+            }
+            _ => panic!("invalid state transition"),
+        };
+    }
+
+    fn to_zero_rtt(&mut self) {
+        match std::mem::replace(self, State::Invalid) {
+            State::Initial(hs) => {
+                *self = State::ZeroRtt(hs);
+            }
+            _ => panic!("invalid state transition"),
+        };
+    }
+
+    fn to_handshake(&mut self) {
+        match std::mem::replace(self, State::Invalid) {
+            State::ZeroRtt(hs) => {
+                *self = State::Handshake(hs);
+            }
+            _ => panic!("invalid state transition"),
+        };
+    }
+
+    fn to_data(&mut self) -> HandshakeState {
+        match std::mem::replace(self, State::Invalid) {
+            State::Handshake(hs) | State::OneRtt(hs) => {
+                *self = State::Data;
+                hs
+            }
+            _ => panic!("invalid state transition"),
+        }
+    }
+}
+
+impl Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            State::Initial(_) => "Initial",
+            State::ZeroRtt(_) => "ZeroRtt",
+            State::Handshake(_) => "Handshake",
+            State::OneRtt(_) => "OneRtt",
+            State::Data => "Data",
+            State::Invalid => "Invalid",
+        };
+        write!(f, "State::{}", name)
+    }
 }
 
 impl crypto::Session for NquicSession {
@@ -57,204 +131,181 @@ impl crypto::Session for NquicSession {
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
-        // TODO:
+        if let Some(hs) = self.state.get_handshake_state() {
+            let (keys, _) = keys_from_handshake_state(hs, self.side);
+            return Some((keys.header.local, keys.packet.local));
+        }
+
         None
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        // TODO:
-        None
+        // TODO: verify this
+        Some(true)
     }
 
     fn is_handshaking(&self) -> bool {
-        self.handshake
-            .as_ref()
-            .map(|hs| hs.is_handshake_finished())
-            .unwrap_or(false)
+        !matches!(self.state, State::Data)
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        println!("[{:?}] read_handshake {}bytes", self.side, buf.len());
-        if let Some(ref mut hs) = self.handshake {
-            if self.handshake_data_remote.is_some() {
-                return Err(protocol_violation("remote handshake data already received"));
+        println!(
+            "[{:?}] read_handshake {}bytes {:?}",
+            self.side,
+            buf.len(),
+            self.state
+        );
+        match (self.side, &mut self.state) {
+            (Side::Server, State::Initial(ref mut hs)) => {
+                let payload = hs
+                    .read_message_vec(buf)
+                    .map_err(|e| protocol_violation(format!("Noise error: {e}")))?;
+
+                let handshake_data = HandshakeData::from_bytes(&payload, Side::Client)
+                    .map_err(protocol_violation)?;
+                match handshake_data {
+                    HandshakeData::Client { .. } => {
+                        // TODO: validate client identity?
+                    }
+                    HandshakeData::Server { .. } => {
+                        return Err(protocol_violation(format!(
+                            "handshake: expected client response, got server response"
+                        )));
+                    }
+                }
+                self.handshake_data_remote = Some(handshake_data);
+                self.state.to_zero_rtt();
+                println!("[{:?}] got handshake data remote", self.side);
+
+                Ok(true)
             }
+            (Side::Client, State::Handshake(ref mut hs)) => {
+                let payload = hs
+                    .read_message_vec(buf)
+                    .map_err(|e| protocol_violation(format!("Noise error: {e}")))?;
 
-            let mut payload = vec![0u8; MAXMSG_LEN];
-
-            match hs.read_message(buf, &mut payload) {
-                Ok(n) => {
-                    payload.truncate(n);
-                    let remote_side = !self.side;
-                    let handshake_data = HandshakeData::from_bytes(&payload, remote_side)
-                        .map_err(protocol_violation)?;
-
-                    match self.side {
-                        Side::Client => {
-                            assert!(hs.is_initiator());
-                            assert!(hs.is_handshake_finished());
-
-                            match handshake_data {
-                                HandshakeData::Client { .. } => {
-                                    return Err(protocol_violation(format!(
-                                        "handshake: expected server response, got client response"
-                                    )));
-                                }
-                                HandshakeData::Server {
-                                    ref alpn_protocol, ..
-                                } => {
-                                    // Validate ALPN choice
-                                    if let Some(alpn_protocol) = alpn_protocol {
-                                        if !self.alpn_protocols.contains(alpn_protocol) {
-                                            return Err(protocol_violation(format!(
-                                                "handshake: invalid ALPN selected"
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Side::Server => {
-                            assert!(!hs.is_initiator());
-
-                            match handshake_data {
-                                HandshakeData::Client { .. } => {
-                                    // TODO: validate client identity?
-                                }
-                                HandshakeData::Server { .. } => {
-                                    return Err(protocol_violation(format!(
-                                        "handshake: expected client response, got server response"
-                                    )));
-                                }
+                let handshake_data = HandshakeData::from_bytes(&payload, Side::Server)
+                    .map_err(protocol_violation)?;
+                match handshake_data {
+                    HandshakeData::Client { .. } => {
+                        return Err(protocol_violation(format!(
+                            "handshake: expected server response, got client response"
+                        )));
+                    }
+                    HandshakeData::Server {
+                        ref alpn_protocol, ..
+                    } => {
+                        // Validate ALPN choice
+                        if let Some(alpn_protocol) = alpn_protocol {
+                            if !self.alpn_protocols.contains(alpn_protocol) {
+                                return Err(protocol_violation(format!(
+                                    "handshake: invalid ALPN selected"
+                                )));
                             }
                         }
                     }
-                    self.handshake_data_remote = Some(handshake_data);
-                    println!("[{:?}] got handshake data remote", self.side);
-                    Ok(true)
                 }
-                Err(e) => {
-                    println!("[{:?}] err: {:?}", self.side, e);
-                    Err(protocol_violation(format!("Noise error: {e}")))
-                }
+
+                self.handshake_data_remote = Some(handshake_data);
+                self.state.to_one_rtt();
+                println!("[{:?}] got handshake data remote", self.side);
+                Ok(true)
             }
-        } else {
-            Err(protocol_violation(format!("unexpected handshake")))
+            _ => Err(protocol_violation(format!("unexpected handshake"))),
         }
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+        // TODO: verify this is the right check
+        if matches!(self.state, State::Handshake(_)) && self.side == Side::Client {
+            return Ok(Some(self.params_local));
+        }
+
         Ok(self
             .handshake_data_remote
             .as_ref()
-            .map(|h| h.transport_parameters().clone()))
+            .map(|h| *h.transport_parameters()))
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
         println!(
-            "[{:?}] write_handshake {} {} {:?}",
+            "[{:?}] write_handshake {:?} {}",
             self.side,
-            self.handshake_sent,
+            self.state,
             self.handshake_data_remote.is_some(),
-            self.handshake.as_ref().map(|s| s.is_handshake_finished()),
         );
-        if let Some(ref mut hs) = self.handshake {
-            match self.side {
-                Side::Client => {
-                    if hs.is_my_turn() && !hs.is_handshake_finished() {
-                        buf.resize(MAXMSG_LEN, 0);
-                        let len = if self.handshake_sent {
-                            hs.write_message(&[], buf).unwrap()
-                        } else {
-                            // Send handshake request
-                            let response = HandshakeData::Client {
-                                alpn_protocols: self.alpn_protocols.clone(),
-                                transport_parameters: self.params_local.clone(),
-                            };
-                            let payload = response.as_bytes();
-                            let len = hs.write_message(&payload, buf).unwrap();
-                            self.handshake_sent = true;
-                            len
-                        };
-                        buf.truncate(len);
+        match (self.side, &mut self.state) {
+            (Side::Client, State::Initial(ref mut hs)) => {
+                // Send handshake request
+                let response = HandshakeData::Client {
+                    alpn_protocols: self.alpn_protocols.clone(),
+                    transport_parameters: self.params_local.clone(),
+                };
+                let payload = response.as_bytes();
+                buf.resize(payload.len() + hs.get_next_message_overhead(), 0);
+                hs.write_message(&payload, buf).unwrap();
+                println!("[{:?}] wrote handshake message", self.side);
+                self.state.to_zero_rtt();
 
-                        println!("[{:?}] wrote handshake message {}bytes", self.side, len);
-                    }
-
-                    if self.handshake_sent
-                        && self.handshake_data_remote.is_none()
-                        && !self.handshake_keys_generated
-                    {
-                        // Initial hello sent out
-                        // Quinn expects its own Handshake set of keys so generate these.
-
-                        println!("[{:?}] generated handshake keys", self.side);
-                        self.handshake_keys_generated = true;
-                        // TODO: these are very likely not the keys we want to use, figure out a better construction
-                        return Some(initial_keys(
-                            VERSION,
-                            &ConnectionId::new(&[0u8; 8]),
-                            self.side,
-                        ));
-                    }
-
-                    if self.handshake_data_remote.is_some() && hs.is_handshake_finished() {
-                        // Handshake finished.
-                        // We can now generate the final data keys.
-
-                        let hs = self.handshake.take().unwrap();
-
-                        let (keys, next_secrets) = keys_from_handshake_state(hs, self.side);
-                        println!("[{:?}] generated secure keys", self.side);
-                        self.next_secrets = Some(next_secrets);
-                        return Some(keys);
-                    }
-                }
-                Side::Server => {
-                    assert!(!hs.is_initiator());
-                    if !self.handshake_keys_generated {
-                        // Initial hello sent out
-                        // Quinn expects its own Handshake set of keys so generate these.
-
-                        println!("[{:?}] generated handshake keys", self.side);
-                        self.handshake_keys_generated = true;
-                        // TODO: these are very likely not the keys we want to use, figure out a better construction
-                        return Some(initial_keys(
-                            VERSION,
-                            &ConnectionId::new(&[0u8; 8]),
-                            self.side,
-                        ));
-                    }
-
-                    if self.handshake_data_remote.is_some() && hs.is_my_turn() {
-                        // Send handshake response.
-                        assert!(self.handshake_data_remote.is_some());
-                        // respond
-                        let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
-                        let response = HandshakeData::Server {
-                            alpn_protocol: handshake_data_remote
-                                .select_alpn_protocol(&self.alpn_protocols),
-                            server_name: None, // TODO:
-                            transport_parameters: self.params_local.clone(),
-                        };
-
-                        let payload = response.as_bytes();
-                        buf.resize(MAXMSG_LEN, 0);
-                        let len = hs.write_message(&payload, buf).unwrap();
-                        buf.truncate(len);
-                        assert!(hs.is_handshake_finished());
-
-                        let hs = self.handshake.take().unwrap();
-                        let (keys, next_secrets) = keys_from_handshake_state(hs, self.side);
-                        println!("[{:?}] generated secure keys", self.side);
-                        self.next_secrets = Some(next_secrets);
-                        return Some(keys);
-                    }
-                }
+                None
             }
-        }
+            (_, State::ZeroRtt(_)) => {
+                self.state.to_handshake();
+                // Initial hello sent out
+                // Quinn expects its own Handshake set of keys so generate these.
 
-        None
+                println!("[{:?}] generated handshake keys", self.side);
+
+                // TODO: these are very likely not the keys we want to use, figure out a better construction
+                Some(initial_keys(
+                    VERSION,
+                    &ConnectionId::new(&[0u8; 8]),
+                    self.side,
+                ))
+            }
+            (Side::Server, State::Handshake(ref mut hs)) => {
+                // Send handshake response.
+                assert!(self.handshake_data_remote.is_some());
+                // respond
+                let handshake_data_remote = self.handshake_data_remote.as_ref().unwrap();
+                let response = HandshakeData::Server {
+                    alpn_protocol: handshake_data_remote.select_alpn_protocol(&self.alpn_protocols),
+                    server_name: None, // TODO:
+                    transport_parameters: self.params_local.clone(),
+                };
+
+                let payload = response.as_bytes();
+                buf.resize(payload.len() + hs.get_next_message_overhead(), 0);
+                hs.write_message(&payload, buf).unwrap();
+                assert!(hs.completed());
+
+                let hs = self.state.to_data();
+                let (keys, next_secrets) = keys_from_handshake_state(&hs, self.side);
+                println!("[{:?}] generated secure keys", self.side);
+                self.next_secrets = Some(next_secrets);
+                Some(keys)
+            }
+            (_, State::OneRtt(ref mut hs)) => {
+                println!("{:?} {:?}", self.side, hs.completed());
+                assert!(hs.completed());
+                /*if self.side == Side::Client {
+                    // Finish the handshake
+                    // TODO: can this be optimized?
+                    buf.resize(hs.get_next_message_overhead(), 0);
+                    hs.write_message(&[], buf).unwrap();
+                }*/
+                // Handshake finished.
+                // We can now generate the final data keys.
+
+                let hs = self.state.to_data();
+                let (keys, next_secrets) = keys_from_handshake_state(&hs, self.side);
+                println!("[{:?}] generated secure keys", self.side);
+                self.next_secrets = Some(next_secrets);
+
+                Some(keys)
+            }
+            (_, _) => None,
+        }
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn crypto::PacketKey>>> {
@@ -317,7 +368,7 @@ const SAMPLE_LEN: usize = BLOCK_LEN;
 impl HeaderProtectionKey {
     fn from_secret(secret: &[u8]) -> Self {
         let secret = hkdf_expand(secret, b"quic hp", &[]);
-        let aes = aes::Aes256::new_from_slice(&secret).expect("known size");
+        let aes = aes::Aes256::new_from_slice(secret.as_slice()).expect("known size");
         Self(aes)
     }
 
@@ -503,7 +554,7 @@ impl HandshakeData {
                 // all good
             }
             (_, _) => {
-                return Err("side missmatch");
+                return Err("handshakedata: side missmatch");
             }
         }
         pos += 1;
@@ -669,8 +720,8 @@ impl HandshakeData {
 }
 
 pub struct ClientConfig {
-    pub remote_public_key: [u8; 32],
-    pub local_private_key: [u8; 32],
+    pub remote_public_key: DhPublicKey,
+    pub local_private_key: DhPrivateKey,
     /// Available ALPN protocol names.
     /// Ordered by most perferred first.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -687,20 +738,22 @@ impl crypto::ClientConfig for ClientConfig {
 
         // TODO: include server_name in the prologue?
 
-        let handshake = snow::Builder::new(PATTERN.parse().unwrap())
-            .local_private_key(&self.local_private_key)
-            .remote_public_key(&self.remote_public_key)
-            .build_initiator()
-            .unwrap();
+        let mut builder = HandshakeStateBuilder::new();
+        builder
+            .set_pattern(noise_protocol::patterns::noise_ik())
+            .set_is_initiator(true) // Client initiates
+            .set_prologue(&[]) // No prologue for now
+            .set_s(U8Array::clone(&self.local_private_key)) // Local Static Key (Private)
+            .set_rs(U8Array::clone(&self.remote_public_key)); // Remote Static Key (Public)
+
+        let handshake = builder.build_handshake_state();
 
         Ok(Box::new(NquicSession {
-            handshake: Some(handshake),
             handshake_data_remote: None,
             params_local: params.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             side: Side::Client,
-            handshake_sent: false,
-            handshake_keys_generated: false,
+            state: State::Initial(handshake),
             next_secrets: None,
         }))
     }
@@ -710,7 +763,7 @@ pub struct ServerConfig {
     /// Available ALPN protocol names.
     /// Ordered by most perferred first.
     pub alpn_protocols: Vec<Vec<u8>>,
-    pub local_private_key: [u8; 32],
+    pub local_private_key: DhPrivateKey,
 }
 
 impl crypto::ServerConfig for ServerConfig {
@@ -721,18 +774,21 @@ impl crypto::ServerConfig for ServerConfig {
     ) -> Box<dyn crypto::Session> {
         debug_assert_eq!(version, VERSION);
 
-        let handshake = snow::Builder::new(PATTERN.parse().unwrap())
-            .local_private_key(&self.local_private_key)
-            .build_responder()
-            .unwrap();
+        let mut builder = HandshakeStateBuilder::new();
+        builder
+            .set_pattern(noise_protocol::patterns::noise_ik())
+            .set_is_initiator(false) // Server responds
+            .set_prologue(&[]) // No prologue for now
+            .set_s(U8Array::clone(&self.local_private_key)); // Local Static Key (Private)
+
+        let handshake = builder.build_handshake_state();
+
         Box::new(NquicSession {
-            handshake: Some(handshake),
             handshake_data_remote: None,
             params_local: params.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             side: Side::Server,
-            handshake_sent: false,
-            handshake_keys_generated: false,
+            state: State::Initial(handshake),
             next_secrets: None,
         })
     }
@@ -770,19 +826,13 @@ impl crypto::ServerConfig for ServerConfig {
 }
 
 pub struct PacketKey {
-    cipher: Box<dyn snow::types::Cipher>,
+    key: <noise_rust_crypto::Aes256Gcm as Cipher>::Key,
 }
 
 impl PacketKey {
     fn from_secret(secret: &[u8]) -> Self {
-        let resolver = snow::resolvers::DefaultResolver::default();
-        let mut cipher = resolver
-            .resolve_cipher(&snow::params::CipherChoice::AESGCM)
-            .unwrap();
-
-        let secret = hkdf_expand(secret, b"quic key", &[]);
-        cipher.set(&secret);
-        PacketKey { cipher }
+        let key = hkdf_expand(secret, b"quic key", &[]);
+        PacketKey { key }
     }
 }
 
@@ -797,7 +847,7 @@ impl crypto::PacketKey for PacketKey {
 
         let payload_in = payload[..payload.len() - TAG_LEN].to_vec(); // TODO: avoid
 
-        self.cipher.encrypt(packet, &header, &payload_in, payload);
+        Aes256Gcm::encrypt(&self.key, packet, &header, &payload_in, payload);
     }
 
     fn decrypt(
@@ -806,17 +856,22 @@ impl crypto::PacketKey for PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
+        let plain_len = payload
+            .len()
+            .checked_sub(self.tag_len())
+            .ok_or_else(|| CryptoError)?;
         let payload_in = payload.to_vec(); // TODO: avoid
-        let plain_len = self
-            .cipher
-            .decrypt(packet, header, &payload_in, payload.as_mut())
+        let payload_out = &mut payload[..plain_len];
+        Aes256Gcm::decrypt(&self.key, packet, header, &payload_in, payload_out)
             .map_err(|_| CryptoError)?;
+
         payload.truncate(plain_len);
+
         Ok(())
     }
 
     fn tag_len(&self) -> usize {
-        TAG_LEN
+        Aes256Gcm::tag_len()
     }
 
     fn confidentiality_limit(&self) -> u64 {
@@ -887,8 +942,8 @@ fn new_packet_keys(secret: &Secret) -> KeyPair<Box<dyn crypto::PacketKey>> {
 }
 
 struct Secret {
-    client: [u8; 32],
-    server: [u8; 32],
+    client: Sensitive<[u8; 32]>,
+    server: Sensitive<[u8; 32]>,
     side: Side,
 }
 
@@ -910,15 +965,12 @@ impl Secret {
         // This is the expansion from TLS
         // TODO: this should probably be switched to the rekey
         // method from noise.
-        self.client = hkdf_expand(&self.client, b"quic ku", &[]);
-        self.server = hkdf_expand(&self.server, b"quic ku", &[]);
+        self.client = hkdf_expand(self.client.as_slice(), b"quic ku", &[]);
+        self.server = hkdf_expand(self.server.as_slice(), b"quic ku", &[]);
     }
 }
 
-/// Output size for sha2::Sha256.
-const OKM_SIZE: usize = 32;
-
-fn hkdf_expand(prk: &[u8], label: &[u8], context: &[u8]) -> [u8; OKM_SIZE] {
+fn hkdf_expand(prk: &[u8], label: &[u8], context: &[u8]) -> Sensitive<[u8; 32]> {
     const LABEL_PREFIX: &[u8] = b"quic-noise ";
 
     let label_len = u8::try_from(LABEL_PREFIX.len() + label.len())
@@ -937,20 +989,20 @@ fn hkdf_expand(prk: &[u8], label: &[u8], context: &[u8]) -> [u8; OKM_SIZE] {
         context,
     ];
 
-    let mut out = [0u8; OKM_SIZE];
-    hs.expand_multi_info(&info, &mut out)
+    let mut out = Sensitive::<[u8; 32]>::from_slice(&[0u8; 32]);
+    hs.expand_multi_info(&info, out.as_mut())
         .expect("invalid expansion length");
 
     out
 }
 
-fn keys_from_handshake_state(mut hs: snow::HandshakeState, side: Side) -> (Keys, Secret) {
+fn keys_from_handshake_state(hs: &HandshakeState, side: Side) -> (Keys, Secret) {
     // Can not use `StatelessTransportMode` directly, so split manually.
-    let (left_secret, right_secret) = hs.dangerously_get_raw_split();
+    let (left_secret, right_secret) = hs.get_ciphers();
 
     let mut secrets = Secret {
-        client: left_secret,
-        server: right_secret,
+        client: left_secret.extract().0,
+        server: right_secret.extract().0,
         side,
     };
     let keys = new_keys(&secrets);
@@ -966,11 +1018,30 @@ fn protocol_violation(reason: impl Into<String>) -> TransportError {
     }
 }
 
-/// Helper to generate static keypairs
-pub fn generate_keypair() -> snow::Keypair {
-    snow::Builder::new(PATTERN.parse().unwrap())
-        .generate_keypair()
-        .unwrap()
+pub type DhPublicKey = <X25519 as DH>::Pubkey;
+pub type DhPrivateKey = <X25519 as DH>::Key;
+
+pub struct DhKeypair {
+    pub private: DhPrivateKey,
+    pub public: DhPublicKey,
+}
+
+impl DhKeypair {
+    pub fn private(&self) -> DhPrivateKey {
+        U8Array::clone(&self.private)
+    }
+
+    pub fn public(&self) -> DhPublicKey {
+        U8Array::clone(&self.public)
+    }
+}
+
+impl Default for DhKeypair {
+    fn default() -> Self {
+        let private = X25519::genkey();
+        let public = X25519::pubkey(&private);
+        DhKeypair { private, public }
+    }
 }
 
 #[cfg(test)]
@@ -1018,15 +1089,13 @@ mod test {
 
     #[test]
     fn test_retry_tag() {
-        let mut local_private_key = [0u8; 32];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut local_private_key);
-
+        let mut local_private_key = DhKeypair::default();
         let server_config = ServerConfig {
             alpn_protocols: vec![b"hello".to_vec()],
-            local_private_key,
+            local_private_key: local_private_key.private,
         };
 
+        let mut rng = rand::thread_rng();
         let dest_cid = ConnectionId::new(&[1, 2, 3]);
         let mut packet = [0u8; 128];
         rng.fill_bytes(&mut packet);
@@ -1039,33 +1108,36 @@ mod test {
 
     #[test]
     fn test_handshake() {
-        let builder = || snow::Builder::new(PATTERN.parse().unwrap());
+        let builder = || {
+            let mut builder = HandshakeStateBuilder::<X25519>::new();
+            builder
+                .set_pattern(noise_protocol::patterns::noise_ik())
+                .set_prologue(&[]);
+            builder
+        };
 
-        let key_r = generate_keypair();
-        let key_i = generate_keypair();
+        let key_r = DhKeypair::default();
+        let key_i = DhKeypair::default();
 
-        let mut handshake_i = builder()
-            .local_private_key(&key_i.private)
-            .remote_public_key(&key_r.public)
-            .build_initiator()
-            .unwrap();
+        let mut b = builder();
+        b.set_is_initiator(true)
+            .set_s(key_i.private)
+            .set_rs(U8Array::clone(&key_r.public));
+        let mut handshake_i = b.build_handshake_state::<Aes256Gcm, Sha256>();
 
-        let mut handshake_r = builder()
-            .local_private_key(&key_r.private)
-            .build_responder()
-            .unwrap();
+        let mut b = builder();
+        b.set_is_initiator(false).set_s(key_r.private);
+        let mut handshake_r = b.build_handshake_state::<Aes256Gcm, Sha256>();
 
-        let mut buf = vec![0u8; MAXMSG_LEN];
-        let l = handshake_i.write_message(b"hello", &mut buf).unwrap();
-        let mut out_buf = vec![0u8; MAXMSG_LEN];
-        let r = handshake_r.read_message(&buf[..l], &mut out_buf).unwrap();
-        assert_eq!(&out_buf[..r], b"hello");
+        let buf = handshake_i.write_message_vec(b"hello").unwrap();
+        let msg = handshake_r.read_message_vec(&buf).unwrap();
+        assert_eq!(&msg, b"hello");
 
-        let l = handshake_r.write_message(&[], &mut buf).unwrap();
-        let r = handshake_i.read_message(&buf[..l], &mut out_buf).unwrap();
-        assert_eq!(r, 0);
+        let buf = handshake_r.write_message_vec(&[]).unwrap();
+        let msg = handshake_i.read_message_vec(&buf).unwrap();
+        assert!(msg.is_empty());
 
-        assert!(handshake_i.is_handshake_finished());
-        assert!(handshake_r.is_handshake_finished());
+        assert!(handshake_i.completed());
+        assert!(handshake_r.completed());
     }
 }
