@@ -1,7 +1,9 @@
 pub mod rustcrypto;
-mod session;
-
+pub use self::keys::{DhKeypair, DhPrivateKey, DhPublicKey};
 pub use self::session::*;
+
+mod keys;
+mod session;
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +12,10 @@ mod tests {
 
     use rand::RngCore;
 
-    use crate::rustcrypto::{HandshakeTokenKey, HmacKey};
+    use crate::{
+        keys::DhKeypair,
+        rustcrypto::{HandshakeTokenKey, HmacKey},
+    };
 
     use super::*;
 
@@ -49,7 +54,7 @@ mod tests {
             (ep, key)
         };
 
-        let (client_ep, client_key) = {
+        let (client_ep, _client_key) = {
             let key = DhKeypair::default();
             let nquic_client_config = ClientConfig {
                 alpn_protocols: vec![TEST_ALPN.to_vec()],
