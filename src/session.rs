@@ -31,6 +31,8 @@ pub struct NquicSession {
     state: State,
     /// Set of next sedcrets to use.
     next_secrets: Option<Secret>,
+    /// Remote static public key.
+    remote_pub_key: Option<DhPublicKey>,
 }
 
 enum State {
@@ -118,8 +120,7 @@ impl crypto::Session for NquicSession {
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        // TODO: what should this be?
-        None
+        self.remote_pub_key.map(|k| -> Box<dyn Any> { Box::new(k) })
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
@@ -166,6 +167,7 @@ impl crypto::Session for NquicSession {
                     }
                 }
                 self.handshake_data_remote = Some(handshake_data);
+                self.remote_pub_key = hs.get_rs();
                 self.state.to_zero_rtt();
                 println!("[{:?}] got handshake data remote", self.side);
 
@@ -602,6 +604,7 @@ impl crypto::ClientConfig for ClientConfig {
             side: Side::Client,
             state: State::Initial(handshake),
             next_secrets: None,
+            remote_pub_key: Some(self.remote_public_key),
         }))
     }
 }
@@ -637,6 +640,7 @@ impl crypto::ServerConfig for ServerConfig {
             side: Side::Server,
             state: State::Initial(handshake),
             next_secrets: None,
+            remote_pub_key: None,
         })
     }
 
