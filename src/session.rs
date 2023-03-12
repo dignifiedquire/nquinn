@@ -313,11 +313,17 @@ impl crypto::Session for NquicSession {
 
     fn export_keying_material(
         &self,
-        output: &mut [u8],
-        label: &[u8],
-        context: &[u8],
+        _output: &mut [u8],
+        _label: &[u8],
+        _context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        todo!()
+        // Idea:
+        // - Use next_secrets
+        // - Similar construction to new keys, but instead
+        // - fill the available space
+        //
+        // Not used by quinn at the moment though.
+        unimplemented!()
     }
 }
 
@@ -372,6 +378,7 @@ pub enum HandshakeData {
 }
 
 impl HandshakeData {
+    #[cfg(test)]
     fn side(&self) -> Side {
         match self {
             HandshakeData::Client { .. } => Side::Client,
