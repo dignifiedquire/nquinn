@@ -243,19 +243,16 @@ impl crypto::Session for NquicSession {
 
                 None
             }
-            (_, State::ZeroRtt(_)) => {
-                self.state.to_handshake();
+            (_, State::ZeroRtt(ref hs)) => {
                 // Initial hello sent out
                 // Quinn expects its own Handshake set of keys so generate these.
 
                 println!("[{:?}] generated handshake keys", self.side);
 
                 // TODO: these are very likely not the keys we want to use, figure out a better construction
-                Some(initial_keys(
-                    VERSION,
-                    &ConnectionId::new(&[0u8; 8]),
-                    self.side,
-                ))
+                let (keys, _) = keys_from_handshake_state(hs, self.side);
+                self.state.to_handshake();
+                Some(keys)
             }
             (Side::Server, State::Handshake(ref mut hs)) => {
                 // Send handshake response.
